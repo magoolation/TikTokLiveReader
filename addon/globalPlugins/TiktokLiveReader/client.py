@@ -144,15 +144,28 @@ _files_lock = threading.Lock()
 _pending_lines = {}
 # Entries read by navigation, by path: (the file's size in bytes, its entries).
 _read_entries = {}
+# Who wrote the lines written while NVDA runs, by line: (handle, name). The
+# line alone cannot tell, a name may contain ": ".
+_line_authors = collections.OrderedDict()
 
 
 def _split_entries(text):
     return [ln.strip() for ln in text.split("\n") if ln.strip()]
 
 
-def _append_line(path, line):
+def _append_line(path, line, author=None):
     with _files_lock:
         _pending_lines.setdefault(path, []).append(line + "\n")
+        if author is not None:
+            _line_authors[line.strip()] = author
+            while len(_line_authors) > MAX_TRACKED_ITEMS:
+                _line_authors.popitem(last=False)
+
+
+def author_of(entry):
+    """(handle, name) of whoever an entry read by navigation is about, or None."""
+    with _files_lock:
+        return _line_authors.get(entry)
 
 
 def _write_pending(paths):
@@ -252,11 +265,14 @@ class LikeManager:
 
         self._baselines = {}
         self._current_totals = {}
+        self._handles = {}
 
         self._lock = threading.Lock()
 
-    def add_like(self, user, current_api_total):
+    def add_like(self, user, current_api_total, handle=None):
         with self._lock:
+            if handle:
+                self._handles[user] = handle
             if user not in self._baselines:
                 self._baselines[user] = self._current_totals.get(user, 0)
 
@@ -301,19 +317,24 @@ class LikeManager:
     def _flush(self, user, count):
         if count <= 0:
             return
+        handle = self._handles.get(user)
+        # Ignored while their likes were being summed.
+        if _is_ignored_handle(handle):
+            return
+        author = (handle, user) if handle else None
 
         # Translators: Singular and plural forms for likes in the logs.
         likes_word = _nt("like", "likes", count)
         log_line = f"{user}: {count} {likes_word}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-        _append_line(LIKES_FILE, log_line)
+        _append_line(LIKES_FILE, log_line, author)
 
 
         if PREFS.get("likes", False):
-             _log_to_events(log_line)
-        
+             _log_to_events(log_line, author)
+
         speak_line = f"{user}: {count} {likes_word}"
 
-        _handle_speech_and_sound("likes", speak_line)
+        _handle_speech_and_sound("likes", speak_line, author)
 
     def stop(self):
         with self._lock:
@@ -323,6 +344,7 @@ class LikeManager:
             self._deadlines.clear()
             self._baselines.clear()
             self._current_totals.clear()
+            self._handles.clear()
 
 like_manager = LikeManager()
 
@@ -363,8 +385,8 @@ class SoundManager:
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
 
-    def play(self, event_name, play_file=True, on_complete=None, post_delay=1.0):
-        
+    def play(self, event_name, play_file=True, on_complete=None, post_delay=1.0, author=None):
+
         mapping = {
             "comments": "comment.wav",
             "followers": "follower.wav",
@@ -376,7 +398,7 @@ class SoundManager:
         }
         
         fname = mapping.get(event_name, f"{event_name}.wav")
-        self._queue.put((fname, play_file, on_complete, post_delay, time.monotonic()))
+        self._queue.put((fname, play_file, on_complete, post_delay, time.monotonic(), author))
 
     def _worker(self):
         me = threading.current_thread()
@@ -386,8 +408,12 @@ class SoundManager:
             except queue.Empty:
                 continue
 
-            fname, play_file, cb, post_delay, queued_at = item
-            if time.monotonic() - queued_at > STALE_AFTER:
+            fname, play_file, cb, post_delay, queued_at, author = item
+            # Ignored since it was queued: their earlier comments are not
+            # read out either.
+            if time.monotonic() - queued_at > STALE_AFTER or (
+                author is not None and _is_ignored_handle(author[0])
+            ):
                 self._queue.task_done()
                 continue
 
@@ -524,10 +550,27 @@ AUTO_SPEAK_PREFS = {}
 PLAY_SOUNDS = True
 SOUND_VOLUME = 100
 SETTINGS_OPEN = False
+# People whose comments, likes, shares and visits are neither written nor
+# announced, by handle (TikTok's unique id, lower case): the name last seen.
+IGNORED_USERS = {}
 
 def set_settings_open(is_open):
     global SETTINGS_OPEN
     SETTINGS_OPEN = is_open
+
+def set_ignored_users(users):
+    global IGNORED_USERS
+    IGNORED_USERS = dict(users)
+
+def _handle_of(user):
+    handle = getattr(user, "unique_id", None)
+    return str(handle).lower() if handle else None
+
+def _is_ignored_handle(handle):
+    return bool(handle) and handle in IGNORED_USERS
+
+def _is_ignored(event):
+    return _is_ignored_handle(_handle_of(getattr(event, "user", None)))
 
 def _is_processed(event):
     uid = getattr(event, "msgId", None)
@@ -614,10 +657,25 @@ def _section_prefs(config, section):
     }
 
 
+IGNORED_USERS_SECTION = "ignored_users"
+
+
+def _ignored_users(config):
+    if IGNORED_USERS_SECTION not in config:
+        return {}
+    return {handle: name for handle, name in config.items(IGNORED_USERS_SECTION)}
+
+
+def ignored_users_section(users):
+    """users as the settings file keeps them; % is doubled for configparser."""
+    return {handle: str(name).replace("%", "%%") for handle, name in users.items()}
+
+
 def read_settings(config=None):
     if config is None:
         config = read_config_file()
     return {
+        "ignored_users": _ignored_users(config),
         "username": config.get("main", "username", fallback=""),
         "text_files_destination": config.get("main", "text_files_destination", fallback=str(DEFAULT_LOG_DIR)),
         "prefs": _section_prefs(config, "events"),
@@ -706,6 +764,7 @@ def _clear_all_text_files():
     with _files_lock:
         _pending_lines.clear()
         _read_entries.clear()
+        _line_authors.clear()
         for file in _session_files():
             with open(file, "w", encoding="utf-8"):
                 pass
@@ -864,12 +923,12 @@ def update_top_files():
         ticks += 1
         _stop_event.wait(WRITE_INTERVAL)
 
-def _log_to_events(log_text):
+def _log_to_events(log_text, author=None):
     event_text = log_text.rsplit("  ", 1)[0]
     if event_text in _known_events:
         return
     _known_events.add(event_text)
-    _append_line(EVENTS_FILE, log_text)
+    _append_line(EVENTS_FILE, log_text, author)
 
 def _speak_text(text):
     try:
@@ -906,11 +965,12 @@ def _extract_comment_payload(event):
 
     return nickname, str(comment_text)
 
-def _handle_speech_and_sound(event_key, speak_text):
+def _handle_speech_and_sound(event_key, speak_text, author=None):
     """
     Handles sound playing and speech queuing with delay.
     event_key: 'comments', 'followers', etc.
     speak_text: The text to speak.
+    author: (handle, name) when it is not to be announced once they are ignored.
     """
     if SETTINGS_OPEN:
         return
@@ -930,7 +990,12 @@ def _handle_speech_and_sound(event_key, speak_text):
 
             cb = _on_complete
 
-        sound_manager.play(event_key, play_file=sound_enabled, on_complete=cb)
+        sound_manager.play(event_key, play_file=sound_enabled, on_complete=cb, author=author)
+
+def _author(event, name):
+    """(handle, name) of the event's user, or None without a handle."""
+    handle = _handle_of(getattr(event, "user", None))
+    return (handle, name) if handle else None
 
 def _track_user(event):
     user = getattr(event, "user", None)
@@ -968,7 +1033,10 @@ def _apply_like_event(ev):
     user_name = _sanitize_name(raw_name)
     if not user_name:
         return
-        
+    handle = _handle_of(user_obj)
+    if _is_ignored_handle(handle):
+        return
+
     inc_candidates = ("likeCount", "count", "diggCount", "increment", "delta")
     inc_val = next((getattr(ev, a) for a in inc_candidates if hasattr(ev, a)), 0)
     increment = inc_val if (isinstance(inc_val, int) and inc_val > 0) else 1
@@ -977,7 +1045,7 @@ def _apply_like_event(ev):
     _top_dirty = True
 
     current_user_total = top_likers[user_name]
-    like_manager.add_like(user_name, current_user_total)
+    like_manager.add_like(user_name, current_user_total, handle)
 
 async def on_comment(event):
     if not _should_run:
@@ -986,21 +1054,24 @@ async def on_comment(event):
         return
     
     _track_user(event)
-    
+    if _is_ignored(event):
+        return
+
     payload = _extract_comment_payload(event)
     if not payload:
         return
     display_name, comment_text = payload
+    author = _author(event, display_name)
     user_comment = f"{display_name}: {comment_text}"
     if user_comment in _known_comments:
         return
     _known_comments.add(user_comment)
     log_line = f"{user_comment}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    _append_line(COMMENTS_FILE, log_line)
+    _append_line(COMMENTS_FILE, log_line, author)
     if PREFS.get("comments", True):
-        _log_to_events(log_line)
-        
-    _handle_speech_and_sound("comments", user_comment)
+        _log_to_events(log_line, author)
+
+    _handle_speech_and_sound("comments", user_comment, author)
 
 async def on_follow(event):
     if not _should_run:
@@ -1020,14 +1091,17 @@ async def on_follow(event):
 
     total_followers += 1
     nm = _sanitize_name(event.user.nickname)
+    # Follows and gifts of ignored people still come through, so the host can
+    # thank them; only the lines know who it was.
+    author = _author(event, nm)
     log_line = f"{nm}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    _append_line(FOLLOWERS_FILE, log_line)
+    _append_line(FOLLOWERS_FILE, log_line, author)
     # Translators: Announced when a new user follows the streamer. {name} is the user's name.
     speak_msg = _t("New follower: {name}").format(name=nm)
     log_msg = f"{speak_msg}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    
+
     if PREFS.get("followers", False):
-        _log_to_events(log_msg)
+        _log_to_events(log_msg, author)
         
     _handle_speech_and_sound("followers", speak_msg)
     update_stats_file()
@@ -1064,11 +1138,12 @@ async def on_gift(event):
     log_msg = f"{speak_msg}  {datetime.datetime.now().strftime('%H:%M:%S')}"
     
     file_line = f"{display_name}: {count} {name}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    
-    _append_line(GIFTS_FILE, file_line)
-        
+    author = _author(event, display_name)
+
+    _append_line(GIFTS_FILE, file_line, author)
+
     if PREFS.get("gifts", False):
-        _log_to_events(log_msg)
+        _log_to_events(log_msg, author)
         
     _handle_speech_and_sound("gifts", speak_msg)
     update_stats_file()
@@ -1090,27 +1165,30 @@ async def on_share(event):
         return
         
     _track_user(event)
-    
+    if _is_ignored(event):
+        return
+
     display_name = _sanitize_name(event.user.nickname)
-    
+    author = _author(event, display_name)
+
     now = time.time()
     if now - _known_shares.get(display_name, 0) < 1.0:
         return
     _known_shares[display_name] = now
     _prune_timestamps(_known_shares, 1.0)
-    
+
     log_line = f"{display_name}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    
-    _append_line(SHARES_FILE, log_line)
-        
+
+    _append_line(SHARES_FILE, log_line, author)
+
     if PREFS.get("shares", False):
         # Translators: Announced when a user shares the live stream. {name} is the user's name.
         msg = _t("{name} shared the live").format(name=display_name)
         log_msg = f"{msg}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-        _log_to_events(log_msg)
+        _log_to_events(log_msg, author)
 
     msg = _t("{name} shared the live").format(name=display_name)
-    _handle_speech_and_sound("shares", msg)
+    _handle_speech_and_sound("shares", msg, author)
 
 async def on_social(event):
     if not _should_run:
@@ -1135,24 +1213,27 @@ async def on_join(event):
     _track_user(event)
     
     global total_viewers
+    if _is_ignored(event):
+        return
     user = getattr(event, "user", None)
     display_name = _sanitize_name(getattr(user, "nickname", "someone"))
-    
+    author = _author(event, display_name)
+
     if display_name in visitors:
         return
     visitors.add(display_name)
-    
+
     total_viewers = len(visitors)
     log_line = f"{display_name}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    _append_line(VISITORS_FILE, log_line)
+    _append_line(VISITORS_FILE, log_line, author)
     if PREFS.get("visitors", False):
         # Translators: Announced when a user joins the live stream. {name} is the user's name.
         msg = _t("{name} joined").format(name=display_name)
         log_msg = f"{msg}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-        _log_to_events(log_msg)
-    
+        _log_to_events(log_msg, author)
+
     msg = _t("{name} joined").format(name=display_name)
-    _handle_speech_and_sound("visitors", msg)
+    _handle_speech_and_sound("visitors", msg, author)
     update_stats_file()
 
 async def on_viewer_update(event):
@@ -1475,6 +1556,7 @@ def connect(username=None, on_connect=None, on_retry=None, on_fail=None, retry_c
     SOUND_PREFS = settings["sound_prefs"]
     PLAY_SOUNDS = settings["play_sounds"]
     SOUND_VOLUME = settings["volume"]
+    set_ignored_users(settings["ignored_users"])
     sound_manager.set_volume(SOUND_VOLUME)
     sound_manager.start()
     sound_manager.clear()

@@ -83,6 +83,7 @@ NAV_GESTURES = {
     "kb:NVDA+control+shift+r": "clearTextFiles",
     "kb:NVDA+control+shift+v": "reportViewers",
     "kb:NVDA+shift+control+p": "togglePlaySounds",
+    "kb:NVDA+control+shift+i": "toggleIgnoreUser",
 }
 
 
@@ -193,9 +194,14 @@ class GlobalPlugin(NVDA_GlobalPlugin):
         self.username, self.prefs, self.auto_speak_prefs, self.sound_prefs, self.clearOnStart, self.cleanUsernames, self.retryCount, self.playSounds, self.soundVolume, self.autoSpeak, self.textFilesDestination, self.backupSessions = self._load_config()
         self.autoSpeakDelay = 1.0
         self._sessionConnected = False
+        try:
+            self.ignoredUsers = client.read_settings()["ignored_users"]
+        except Exception:
+            self.ignoredUsers = {}
 
         client.set_log_directory(self.textFilesDestination)
         client.update_config(self.username, self.prefs, self.auto_speak_prefs, self.sound_prefs, self.playSounds, self.soundVolume, self.clearOnStart, self.cleanUsernames)
+        client.set_ignored_users(self.ignoredUsers)
 
         if not self.clearOnStart:
             self._load_positions_json()
@@ -268,6 +274,7 @@ class GlobalPlugin(NVDA_GlobalPlugin):
             "play_sounds": "true" if play_sounds else "false",
             "volume": str(volume)
         }
+        cfg[client.IGNORED_USERS_SECTION] = client.ignored_users_section(self.ignoredUsers)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             cfg.write(f)
         self.username = username
@@ -283,6 +290,7 @@ class GlobalPlugin(NVDA_GlobalPlugin):
         self.backupSessions = backup_sessions
 
         client.update_config(self.username, self.prefs, self.auto_speak_prefs, self.sound_prefs, self.playSounds, self.soundVolume, self.clearOnStart, self.cleanUsernames)
+        client.set_ignored_users(self.ignoredUsers)
 
     def _load_positions_json(self):
         try:
@@ -527,6 +535,7 @@ class GlobalPlugin(NVDA_GlobalPlugin):
         p_events = wx.Panel(nb)
         p_autospeak = wx.Panel(nb)
         p_sounds = wx.Panel(nb)
+        p_ignored = wx.Panel(nb)
 
         s_general = wx.BoxSizer(wx.VERTICAL)
         
@@ -739,10 +748,50 @@ class GlobalPlugin(NVDA_GlobalPlugin):
         
         p_autospeak.SetSizer(s_autospeak)
 
+        s_ignored = wx.BoxSizer(wx.VERTICAL)
+        ignored = dict(self.ignoredUsers)
+        ignored_handles = sorted(ignored, key=lambda handle: ignored[handle].lower())
+        # Translators: Label of the list of people the add-on ignores, in the settings.
+        lbl_ignored = wx.StaticText(p_ignored, label=_("&Ignored users"))
+        lst_ignored = wx.ListBox(
+            p_ignored,
+            # Translators: An ignored person in the settings. {name} is their name, {handle} their TikTok user name.
+            choices=[_("{name} (@{handle})").format(name=ignored[h], handle=h) for h in ignored_handles],
+            size=(400, 200),
+        )
+        # Translators: Button that removes the selected person from the ignored users.
+        btn_unignore = wx.Button(p_ignored, label=_("&Stop ignoring"))
+
+        def update_unignore(evt=None):
+            btn_unignore.Enable(lst_ignored.GetSelection() != wx.NOT_FOUND)
+
+        def on_unignore(evt):
+            selection = lst_ignored.GetSelection()
+            if selection == wx.NOT_FOUND:
+                return
+            del ignored[ignored_handles.pop(selection)]
+            lst_ignored.Delete(selection)
+            if ignored_handles:
+                lst_ignored.SetSelection(min(selection, len(ignored_handles) - 1))
+                lst_ignored.SetFocus()
+            update_unignore()
+
+        if ignored_handles:
+            lst_ignored.SetSelection(0)
+        update_unignore()
+        lst_ignored.Bind(wx.EVT_LISTBOX, update_unignore)
+        btn_unignore.Bind(wx.EVT_BUTTON, on_unignore)
+        s_ignored.Add(lbl_ignored, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=5)
+        s_ignored.Add(lst_ignored, 1, flag=wx.EXPAND | wx.ALL, border=5)
+        s_ignored.Add(btn_unignore, flag=wx.ALL, border=5)
+        p_ignored.SetSizer(s_ignored)
+
         nb.AddPage(p_general, _("General"))
         nb.AddPage(p_events, _("Events"))
         nb.AddPage(p_autospeak, _("Auto speak"))
         nb.AddPage(p_sounds, _("Sounds"))
+        # Translators: Title of the settings page listing the people the add-on ignores.
+        nb.AddPage(p_ignored, _("Ignored users"))
 
         topsizer = wx.BoxSizer(wx.VERTICAL)
         topsizer.Add(nb, 1, wx.EXPAND | wx.ALL, 5)
@@ -785,7 +834,7 @@ class GlobalPlugin(NVDA_GlobalPlugin):
             prefs = {k: chk.IsChecked() for k, chk in event_checks.items()}
             auto_speak_prefs = {k: chk.IsChecked() for k, chk in auto_speak_checks.items()}
             sound_prefs = {k: chk.IsChecked() for k, chk in sound_checks.items()}
-
+            self.ignoredUsers = ignored
 
             self._save_config(
                 txt_user.GetValue().strip().lstrip('@'), 
@@ -961,6 +1010,50 @@ class GlobalPlugin(NVDA_GlobalPlugin):
         count = getattr(client, "viewer_count", 0)
         # Translators: Announced when reporting live viewer count. {count} is the number of viewers.
         ui.message(_("{count} viewers").format(count=count))
+
+    @script(
+        # Translators: Describes the command that ignores the person the current item is about, in Input gestures.
+        description=_("Ignore the person the current item is about, or stop ignoring them"),
+        category="TikTok Live Reader",
+    )
+    def script_toggleIgnoreUser(self, gesture):
+        if not self.active:
+            return
+        items = self._load_items()
+        if not items:
+            self._report_no_items()
+            return
+        if not 0 <= self.index < len(items):
+            ui.message(_("No entries"))
+            return
+        author = client.author_of(items[self.index])
+        if author is None:
+            # Translators: Announced when the current item is not about one person (stats, top lists,
+            # guest requests) or was written before NVDA was started.
+            ui.message(_("Nobody to ignore in this item"))
+            return
+        handle, name = author
+        if handle in self.ignoredUsers:
+            del self.ignoredUsers[handle]
+            # Translators: Announced when a person is no longer ignored. {name} is their name.
+            msg = _("{name} is no longer ignored").format(name=name)
+        else:
+            self.ignoredUsers[handle] = " ".join(str(name).splitlines())
+            # Translators: Announced when a person is ignored: their comments, likes, shares and visits
+            # are no longer written or announced. {name} is their name.
+            msg = _("{name} is now ignored").format(name=name)
+        self._save_config(
+            self.username,
+            self.prefs,
+            self.auto_speak_prefs,
+            self.sound_prefs,
+            self.clearOnStart,
+            self.cleanUsernames,
+            self.retryCount,
+            self.playSounds,
+            self.soundVolume
+        )
+        ui.message(msg)
 
     def terminate(self):
         try:
