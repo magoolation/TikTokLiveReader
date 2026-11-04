@@ -6,6 +6,7 @@ half second and before anything reads, archives or clears the files. Read
 entries are kept with the lines written since; a file is read again only from
 where something else appended to it."""
 
+import collections
 import datetime
 import os
 import shutil
@@ -52,6 +53,10 @@ _lock = threading.Lock()
 _pending = {}
 # Entries read by file name: (the file's size in bytes, its entries).
 _entries = {}
+# Who the lines written while NVDA runs are about, by line: (handle, name). The
+# line alone cannot tell, a name may contain ": ".
+_authors = collections.OrderedDict()
+MAX_AUTHORS = 50000
 
 
 def set_folder(directory):
@@ -103,15 +108,28 @@ def clear_all():
 	with _lock:
 		_pending.clear()
 		_entries.clear()
+		_authors.clear()
 		for file in session_files():
 			with open(file, "w", encoding="utf-8"):
 				pass
 
 
-def append(name, line):
-	"""Add ``line`` to the file at the next ``flush``."""
+def append(name, line, author=None):
+	"""Add ``line`` to the file at the next ``flush``; ``author`` is (handle, name)
+	of the person it is about, for ``author_of``."""
 	with _lock:
 		_pending.setdefault(name, []).append(line + "\n")
+		if author is not None:
+			_authors[line.strip()] = author
+			while len(_authors) > MAX_AUTHORS:
+				_authors.popitem(last=False)
+
+
+def author_of(entry):
+	"""(handle, name) of the person an entry read by navigation is about; None
+	when it is about nobody or was written before NVDA started."""
+	with _lock:
+		return _authors.get(entry)
 
 
 def _write_pending(names):

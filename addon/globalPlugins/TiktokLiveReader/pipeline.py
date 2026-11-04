@@ -86,11 +86,31 @@ _stats_lock = threading.Lock()
 _stats_dirty = False
 _stats_last_write = 0.0
 _top_dirty = False
+# Handles of the people whose likes are being summed, by the name they are summed under.
+_like_handles = {}
 
 
 def use_settings(new):
 	global _settings
 	_settings = new
+
+
+def _handle(person):
+	"""The person's TikTok user name in lower case, as the ignored users are kept;
+	None without one."""
+	if person is None or not person.unique_id:
+		return None
+	return str(person.unique_id).lower()
+
+
+def _ignored(handle):
+	return bool(handle) and handle in _settings.ignored_users
+
+
+def _author(person, name):
+	"""(handle, name) for ``store.append``, None without a handle."""
+	handle = _handle(person)
+	return (handle, name) if handle else None
 
 
 def _now():
@@ -185,6 +205,7 @@ def forget_seen():
 	_seen_messages.clear()
 	connection_time = 0
 	_known_followers.clear()
+	_like_handles.clear()
 
 
 def remember_logged():
@@ -298,19 +319,25 @@ def write_top_files():
 		log.debugWarning("TikTok Live Reader: writing the top lists", exc_info=True)
 
 
-def _log_to_events(log_text):
+def _log_to_events(log_text, author=None):
 	if log_text.rsplit("  ", 1)[0] in _events_logged_before:
 		return
 	try:
-		store.append(store.EVENTS, log_text)
+		store.append(store.EVENTS, log_text, author)
 	except OSError:
 		log.debugWarning("TikTok Live Reader: writing the events file", exc_info=True)
 
 
-def _announce(event_key, speak_text):
+def _announce(event_key, speak_text, author=None):
+	"""``author``: (handle, name) of a person whose announcement is dropped when they
+	are ignored before its turn; follows, gifts and requests pass none."""
 	if connection_time == 0 or (time.time() - connection_time) < GRACE_PERIOD:
 		return
-	announcer.announce(event_key, speak_text, _settings)
+
+	def wanted():
+		return not _ignored(author[0])
+
+	announcer.announce(event_key, speak_text, _settings, wanted if author is not None else None)
 
 
 def _track_user(person):
@@ -322,16 +349,21 @@ def _track_user(person):
 
 
 def _report_likes(user, count):
+	handle = _like_handles.get(user)
+	# Ignored while their likes were being summed.
+	if _ignored(handle):
+		return
+	author = (handle, user) if handle else None
 	# Translators: Singular and plural forms for likes in the logs.
 	likes_word = _("like") if count == 1 else _("likes")
 	log_line = f"{user}: {count} {likes_word}  {_now()}"
 	try:
-		store.append(store.LIKES, log_line)
+		store.append(store.LIKES, log_line, author)
 	except OSError:
 		log.debugWarning("TikTok Live Reader: writing the likes file", exc_info=True)
 	if _settings.events.get("likes", False):
-		_log_to_events(log_line)
-	_announce("likes", f"{user}: {count} {likes_word}")
+		_log_to_events(log_line, author)
+	_announce("likes", f"{user}: {count} {likes_word}", author)
 
 
 like_manager = likes.LikeAggregator(_report_likes)
@@ -342,19 +374,22 @@ def _on_comment(event):
 
 	nickname = _clean_name(_display_name(event.user), event.user)
 	_remember_user(event.user.user_id if event.user else None, nickname)
+	if _ignored(_handle(event.user)):
+		return
 	text = _one_line(event.text) if event.text else ""
 	if not text:
 		return
 	user_comment = f"{nickname}: {text}"
 	if user_comment in _comments_logged_before:
 		return
+	author = _author(event.user, nickname)
 	log_line = f"{user_comment}  {_now()}"
 	global total_comments
 	total_comments += 1
-	store.append(store.COMMENTS, log_line)
+	store.append(store.COMMENTS, log_line, author)
 	if _settings.events.get("comments", True):
-		_log_to_events(log_line)
-	_announce("comments", user_comment)
+		_log_to_events(log_line, author)
+	_announce("comments", user_comment, author)
 
 
 def _on_follow(event):
@@ -368,11 +403,14 @@ def _on_follow(event):
 
 	total_followers += 1
 	name = _clean_name(event.user.nickname, event.user)
-	store.append(store.FOLLOWERS, f"{name}  {_now()}")
+	# Follows and gifts of ignored people still come through, for the host to
+	# thank them; the lines know who they are about.
+	author = _author(event.user, name)
+	store.append(store.FOLLOWERS, f"{name}  {_now()}", author)
 	# Translators: Announced when a new user follows the streamer. {name} is the user's name.
 	speak_msg = _("New follower: {name}").format(name=name)
 	if _settings.events.get("followers", False):
-		_log_to_events(f"{speak_msg}  {_now()}")
+		_log_to_events(f"{speak_msg}  {_now()}", author)
 	_announce("followers", speak_msg)
 	update_stats_file()
 
@@ -398,9 +436,10 @@ def _on_gift(event):
 	total_gifts += count
 	speak_msg = f"Gift: {display_name}: {count} {name}"
 	log_msg = f"{speak_msg}  {_now()}"
-	store.append(store.GIFTS, f"{display_name}: {count} {name}  {_now()}")
+	author = _author(event.user, display_name)
+	store.append(store.GIFTS, f"{display_name}: {count} {name}  {_now()}", author)
 	if _settings.events.get("gifts", False):
-		_log_to_events(log_msg)
+		_log_to_events(log_msg, author)
 	_announce("gifts", speak_msg)
 	update_stats_file()
 
@@ -421,17 +460,25 @@ def _on_like(event):
 	user_name = _clean_name(raw_name, user)
 	if not user_name:
 		return
+	handle = _handle(user)
+	if _ignored(handle):
+		return
 
 	global _top_dirty
 	top_likers[user_name] = top_likers.get(user_name, 0) + event.count
 	_top_dirty = True
+	if handle:
+		_like_handles[user_name] = handle
 	like_manager.add(user_name, top_likers[user_name])
 
 
 def _on_share(event):
 	_track_user(event.user)
+	if _ignored(_handle(event.user)):
+		return
 
 	display_name = _clean_name(event.user.nickname, event.user)
+	author = _author(event.user, display_name)
 	if event.repost:
 		# Translators: Announced when a user reposts the live, showing it to their followers. {name} is the user's name.
 		msg = _("{name} reposted the live").format(name=display_name)
@@ -440,30 +487,33 @@ def _on_share(event):
 		msg = _("{name} shared the live").format(name=display_name)
 	global total_shares
 	total_shares += 1
-	store.append(store.SHARES, f"{msg}  {_now()}")
+	store.append(store.SHARES, f"{msg}  {_now()}", author)
 	update_stats_file()
 	if _settings.events.get("shares", False):
-		_log_to_events(f"{msg}  {_now()}")
-	_announce("shares", msg)
+		_log_to_events(f"{msg}  {_now()}", author)
+	_announce("shares", msg, author)
 
 
 def _on_join(event):
 	global total_viewers
 	_track_user(event.user)
+	if _ignored(_handle(event.user)):
+		return
 
 	display_name = _clean_name(_nickname(event.user, "someone"), event.user)
 	if display_name in visitors:
 		return
 	visitors.add(display_name)
+	author = _author(event.user, display_name)
 
 	total_viewers = len(visitors)
-	store.append(store.VISITORS, f"{display_name}  {_now()}")
+	store.append(store.VISITORS, f"{display_name}  {_now()}", author)
 	if _settings.events.get("visitors", False):
 		# Translators: Announced when a user joins the live stream. {name} is the user's name.
 		msg = _("{name} joined").format(name=display_name)
-		_log_to_events(f"{msg}  {_now()}")
+		_log_to_events(f"{msg}  {_now()}", author)
 	msg = _("{name} joined").format(name=display_name)
-	_announce("visitors", msg)
+	_announce("visitors", msg, author)
 	update_stats_file()
 
 

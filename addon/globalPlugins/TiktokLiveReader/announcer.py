@@ -70,9 +70,11 @@ class SoundManager:
 			self._thread = threading.Thread(target=self._worker, daemon=True)
 			self._thread.start()
 
-	def play(self, event_name, play_file=True, on_complete=None, post_delay=1.0):
+	def play(self, event_name, play_file=True, on_complete=None, post_delay=1.0, wanted=None):
+		"""``wanted``, when given, is asked again when the sound's turn comes: the
+		person may have been ignored since."""
 		fname = SOUND_FILES.get(event_name, f"{event_name}.wav")
-		self._queue.put((fname, play_file, on_complete, post_delay, time.monotonic()))
+		self._queue.put((fname, play_file, on_complete, post_delay, time.monotonic(), wanted))
 
 	def _worker(self):
 		me = threading.current_thread()
@@ -82,11 +84,11 @@ class SoundManager:
 		try:
 			while self._running and self._thread is me:
 				try:
-					fname, play_file, callback, post_delay, queued = self._queue.get(timeout=1.0)
+					fname, play_file, callback, post_delay, queued, wanted = self._queue.get(timeout=1.0)
 				except queue.Empty:
 					continue
 
-				if time.monotonic() - queued > STALE_AFTER:
+				if time.monotonic() - queued > STALE_AFTER or (wanted is not None and not wanted()):
 					self._queue.task_done()
 					continue
 
@@ -180,16 +182,17 @@ def silence():
 		log.debugWarning("TikTok Live Reader: stopping the sound failed", exc_info=True)
 
 
-def announce(event_key, text, settings):
+def announce(event_key, text, settings, wanted=None):
 	"""The event's sound, then ``text`` for speech, each as the settings ask;
-	nothing while the settings dialog is open."""
+	nothing while the settings dialog is open, nor when ``wanted()`` says no by
+	the time it is its turn."""
 	if settings_open:
 		return
 	sound_enabled = settings.play_sounds and settings.sounds.get(event_key, False)
 	speech_enabled = settings.auto_speak.get(event_key, False)
 	if sound_enabled or speech_enabled:
 		then_speak = functools.partial(queue_speech, text) if speech_enabled else None
-		sound_manager.play(event_key, play_file=sound_enabled, on_complete=then_speak)
+		sound_manager.play(event_key, play_file=sound_enabled, on_complete=then_speak, wanted=wanted)
 
 
 def say(text):
