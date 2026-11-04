@@ -1,6 +1,10 @@
 from pathlib import Path
+import collections
 import datetime
 import configparser
+import functools
+import io
+import os
 import threading
 import time
 import unicodedata
@@ -130,6 +134,87 @@ def set_log_directory(directory):
     REQUESTS_FILE = LOG_DIR / "requests.txt"
     EVENTS_FILE = LOG_DIR / "events.txt"
 
+
+# The connection thread, the like timer and NVDA's main thread all write the
+# text files. Appended lines wait in memory until flush_files, which the stats
+# thread calls every half second and which runs before anything reads, archives
+# or clears the files: opening a file for each line was slow on busy lives.
+_files_lock = threading.Lock()
+# Lines appended and not written yet, by path.
+_pending_lines = {}
+# Entries read by navigation, by path: (the file's size in bytes, its entries).
+_read_entries = {}
+
+
+def _split_entries(text):
+    return [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+
+def _append_line(path, line):
+    with _files_lock:
+        _pending_lines.setdefault(path, []).append(line + "\n")
+
+
+def _write_pending(paths):
+    """Write the waiting lines of paths; with _files_lock held."""
+    for path in paths:
+        lines = _pending_lines.pop(path, None)
+        if not lines:
+            continue
+        text = "".join(lines)
+        # As text mode writes them, so the files stay what they were.
+        data = text.replace("\n", os.linesep).encode("utf-8")
+        try:
+            with open(path, "ab") as f:
+                start = f.tell()
+                f.write(data)
+        except OSError:
+            continue
+        # Opening a file just written is slow (the antivirus looks at it
+        # again); the lines are known.
+        known = _read_entries.get(path)
+        if known is not None and known[0] == start:
+            _read_entries[path] = (start + len(data), known[1] + _split_entries(text))
+
+
+def flush_files(path=None):
+    """Write the lines appended since the last flush, of path or of every file."""
+    with _files_lock:
+        _write_pending(list(_pending_lines) if path is None else [path])
+
+
+def _write_whole_file(path, text):
+    with _files_lock:
+        _pending_lines.pop(path, None)
+        _read_entries.pop(path, None)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def read_entries(path):
+    """The file's non-empty lines, stripped; none when it cannot be opened. Read
+    on each navigation key, so a file that only grew is read from where the
+    last read stopped. The list returned is not to be changed."""
+    with _files_lock:
+        _write_pending([path])
+        try:
+            size = os.stat(path).st_size
+            known = _read_entries.get(path)
+            if known is not None and known[0] == size:
+                return known[1]
+            # Grown: only the end is new. Otherwise (cleared, replaced) read it all.
+            offset, entries = known if known is not None and size > known[0] else (0, [])
+            with open(path, "rb") as f:
+                f.seek(offset)
+                added = f.read()
+        except OSError:
+            _read_entries.pop(path, None)
+            return []
+        entries = entries + _split_entries(added.decode("utf-8", errors="replace"))
+        _read_entries[path] = (offset + len(added), entries)
+        return entries
+
+
 _known_gifts = {}
 
 def _clear_speech_buffer():
@@ -149,53 +234,80 @@ _top_thread_started = False
 _should_run = False
 
 
+LIKE_PAUSE = 10.0
+# A timer firing this early still counts as on time.
+_LIKE_EARLY = 0.001
+
+
 class LikeManager:
+    """Each person's likes summed until they have not liked for LIKE_PAUSE
+    seconds. One timer serves everyone, set for the earliest pause to end: a
+    timer each (a thread each) made every like message cost milliseconds and
+    left a thread waiting per person."""
+
     def __init__(self):
-        self._timers = {}
-        
+        self._deadlines = {}
+        self._timer = None
+        self._token = None
+
         self._baselines = {}
         self._current_totals = {}
-        
+
         self._lock = threading.Lock()
 
     def add_like(self, user, current_api_total):
         with self._lock:
-            if user in self._timers:
-                self._timers[user].cancel()
-                
             if user not in self._baselines:
                 self._baselines[user] = self._current_totals.get(user, 0)
-                
-            self._current_totals[user] = current_api_total
-            
-            t = threading.Timer(10.0, self._flush, args=[user])
-            t.daemon = True
-            self._timers[user] = t
-            t.start()
 
-    def _flush(self, user):
+            self._current_totals[user] = current_api_total
+
+            # Moved to the end: the dict stays in deadline order.
+            self._deadlines.pop(user, None)
+            self._deadlines[user] = time.time() + LIKE_PAUSE
+            if self._timer is None:
+                self._arm()
+
+    def _arm(self):
+        """Set the timer for the earliest deadline; with _lock held."""
+        if not self._deadlines:
+            self._timer = None
+            return
+        first = next(iter(self._deadlines.values()))
+        token = self._token = object()
+        self._timer = threading.Timer(max(0.0, first - time.time()), self._fire, args=[token])
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self, token):
         with self._lock:
-            if user in self._timers:
-                del self._timers[user]
-                
-            baseline = self._baselines.pop(user, 0)
-            current = self._current_totals.get(user, 0)
-            
-            count = current - baseline
-            
+            # A timer cancelled while it was already firing.
+            if self._timer is None or self._token is not token:
+                return
+            now = time.time() + _LIKE_EARLY
+            due = []
+            for user, deadline in self._deadlines.items():
+                if deadline > now:
+                    break
+                due.append(user)
+            counts = []
+            for user in due:
+                del self._deadlines[user]
+                counts.append((user, self._current_totals.get(user, 0) - self._baselines.pop(user, 0)))
+            self._arm()
+        for user, count in counts:
+            self._flush(user, count)
+
+    def _flush(self, user, count):
         if count <= 0:
             return
-        
+
         # Translators: Singular and plural forms for likes in the logs.
         likes_word = _nt("like", "likes", count)
         log_line = f"{user}: {count} {likes_word}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-        try:
-            with open(LIKES_FILE, "a", encoding="utf-8") as f:
-                f.write(log_line + "\n")
-        except Exception:
-            pass
-            
-        
+        _append_line(LIKES_FILE, log_line)
+
+
         if PREFS.get("likes", False):
              _log_to_events(log_line)
         
@@ -205,13 +317,19 @@ class LikeManager:
 
     def stop(self):
         with self._lock:
-            for t in self._timers.values():
-                t.cancel()
-            self._timers.clear()
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._deadlines.clear()
             self._baselines.clear()
             self._current_totals.clear()
 
 like_manager = LikeManager()
+
+
+# Announcements are at least a second apart, so a busy live leaves them behind;
+# one that waited this long is dropped (it is in the text files).
+STALE_AFTER = 30.0
 
 
 class SoundManager:
@@ -219,6 +337,8 @@ class SoundManager:
         self.base_dir = base_dir
         self.sounds_dir = base_dir.parent.parent / "sounds"
         self.volume = 100
+        # By file name: (volume, the WAV to play from memory).
+        self._sounds = {}
         self._queue = queue.Queue()
         self._running = True
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -256,7 +376,7 @@ class SoundManager:
         }
         
         fname = mapping.get(event_name, f"{event_name}.wav")
-        self._queue.put((fname, play_file, on_complete, post_delay))
+        self._queue.put((fname, play_file, on_complete, post_delay, time.monotonic()))
 
     def _worker(self):
         me = threading.current_thread()
@@ -265,25 +385,11 @@ class SoundManager:
                 item = self._queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-            
-            
-            fname = None
-            play_file = True
-            cb = None
-            post_delay = 1.0
 
-            if isinstance(item, tuple):
-                if len(item) == 4:
-                    fname, play_file, cb, post_delay = item
-                elif len(item) == 3:
-                     fname, play_file, cb = item
-                elif len(item) == 2:
-                    fname, cb = item
-                    play_file = True
-                else:
-                    fname = item[0]
-            else:
-                fname = item
+            fname, play_file, cb, post_delay, queued_at = item
+            if time.monotonic() - queued_at > STALE_AFTER:
+                self._queue.task_done()
+                continue
 
             if fname and play_file:
                 self._play_actual(fname)
@@ -300,32 +406,21 @@ class SoundManager:
             
             self._queue.task_done()
 
-    def _play_actual(self, fname):
-        fpath = self.sounds_dir / fname
-        
-        if not fpath.exists():
-            return
-
+    def _sound(self, fpath):
+        """The WAV at the current volume, scaled once rather than on every play;
+        None when it cannot be read or scaled."""
+        volume = self.volume
+        known = self._sounds.get(fpath.name)
+        if known is not None and known[0] == volume:
+            return known[1]
         try:
             with wave.open(str(fpath), 'rb') as wav_in:
                 params = wav_in.getparams()
-                
-                if self.volume == 100:
-                    winsound.PlaySound(str(fpath), winsound.SND_FILENAME | winsound.SND_SYNC)
-                    return
-
-                if params.sampwidth != 2:
-                    winsound.PlaySound(str(fpath), winsound.SND_FILENAME | winsound.SND_SYNC)
-                    return
-
-                frames = wav_in.readframes(params.nframes)
-                
-                try:
-                    
-                    factor = self.volume / 100.0
-                    
-                    samples = array.array('h', frames)
-                    
+                if volume == 100 or params.sampwidth != 2:
+                    data = fpath.read_bytes()
+                else:
+                    factor = volume / 100.0
+                    samples = array.array('h', wav_in.readframes(params.nframes))
                     for i in range(len(samples)):
                         val = int(samples[i] * factor)
                         if val > 32767:
@@ -333,26 +428,33 @@ class SoundManager:
                         if val < -32768:
                             val = -32768
                         samples[i] = val
-                        
-                    data = samples.tobytes()
-                    
-                    import io
                     mem_file = io.BytesIO()
                     with wave.open(mem_file, 'wb') as wav_out:
                         wav_out.setparams(params)
-                        wav_out.writeframes(data)
-                    
-                    mem_file.seek(0)
-                    winsound.PlaySound(mem_file.read(), winsound.SND_MEMORY | winsound.SND_SYNC)
-                    
-                except Exception:
-                    winsound.PlaySound(str(fpath), winsound.SND_FILENAME | winsound.SND_SYNC)
-                
+                        wav_out.writeframes(samples.tobytes())
+                    data = mem_file.getvalue()
         except Exception:
-            try:
-                winsound.PlaySound(str(fpath), winsound.SND_FILENAME | winsound.SND_SYNC)
-            except Exception:
-                pass
+            return None
+        self._sounds[fpath.name] = (volume, data)
+        return data
+
+    def _play_actual(self, fname):
+        fpath = self.sounds_dir / fname
+
+        if not fpath.exists():
+            return
+
+        try:
+            data = self._sound(fpath)
+            if data is not None:
+                winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_SYNC)
+                return
+        except Exception:
+            pass
+        try:
+            winsound.PlaySound(str(fpath), winsound.SND_FILENAME | winsound.SND_SYNC)
+        except Exception:
+            pass
 
 sound_manager = SoundManager(BASE_DIR)
 
@@ -366,12 +468,14 @@ class BoundedSet:
 
     def __init__(self, limit):
         self._limit = limit
-        self._items = {}
+        # A dict whose oldest keys are deleted gets slower to iterate from the
+        # front until it is resized; an OrderedDict does not.
+        self._items = collections.OrderedDict()
 
     def add(self, item):
         self._items[item] = None
         while len(self._items) > self._limit:
-            del self._items[next(iter(self._items))]
+            self._items.popitem(last=False)
 
     def clear(self):
         self._items.clear()
@@ -396,7 +500,7 @@ def _remember_user(uid, name):
         return
     _known_users[str(uid)] = name
     while len(_known_users) > MAX_TRACKED_ITEMS:
-        del _known_users[next(iter(_known_users))]
+        _known_users.popitem(last=False)
 
 
 top_gifters = {}
@@ -410,7 +514,7 @@ total_viewers = 0
 _known_comments = BoundedSet(MAX_TRACKED_ITEMS)
 _known_events = BoundedSet(MAX_TRACKED_ITEMS)
 _requests_log = {}
-_known_users = {}
+_known_users = collections.OrderedDict()
 _known_followers = BoundedSet(MAX_TRACKED_ITEMS)
 _known_shares = {}
 _processed_ids = BoundedSet(MAX_PROCESSED_IDS)
@@ -574,6 +678,11 @@ def update_config(username, prefs, auto_speak_prefs, sound_prefs, play_sounds, v
 def _sanitize_name(name):
     if not CLEAN_USERNAMES or not isinstance(name, str):
         return name
+    return _letters_kept(name)
+
+# The same people come back with every like and comment.
+@functools.lru_cache(maxsize=4096)
+def _letters_kept(name):
     out = []
     for ch in name:
         cat = unicodedata.category(ch)
@@ -594,15 +703,20 @@ def _session_files():
     ]
 
 def _clear_all_text_files():
-    for file in _session_files():
-        with open(file, "w", encoding="utf-8"):
-            pass
+    with _files_lock:
+        _pending_lines.clear()
+        _read_entries.clear()
+        for file in _session_files():
+            with open(file, "w", encoding="utf-8"):
+                pass
 
 def reset_accumulators():
     global top_gifters, top_likers, total_likes, total_followers, total_diamonds, visitors, viewer_count, total_viewers
     global _known_comments, _known_events, _known_followers, _known_shares, _requests_log, _processed_ids
+    global _top_dirty
     top_gifters = {}
     top_likers = {}
+    _top_dirty = False
     total_likes = 0
     total_followers = 0
     total_diamonds = 0
@@ -651,6 +765,7 @@ def _safe_folder_name(name):
 def archive_session(username):
     """Copy the finished session's text files into Backups/<date time host>/."""
     try:
+        flush_files()
         sources = [f for f in _session_files() if f.is_file()]
         if not sources or not any(f.stat().st_size > 0 for f in sources):
             return None
@@ -679,67 +794,82 @@ _stats_last_write = 0.0
 
 def _write_stats_file():
     try:
-        with open(STATS_FILE, "w", encoding="utf-8") as f:
+        _write_whole_file(
+            STATS_FILE,
             # Translators: Stats file lines. {count} represents the respective count.
-            f.write(_t("Viewers: {count}").format(count=viewer_count) + "\n")
-            f.write(_t("Visitors: {count}").format(count=total_viewers) + "\n")
-            f.write(_t("Likes: {count}").format(count=total_likes) + "\n")
-            f.write(_t("Followers: {count}").format(count=total_followers) + "\n")
-            f.write(_t("Diamonds: {count}").format(count=total_diamonds) + "\n")
+            _t("Viewers: {count}").format(count=viewer_count) + "\n"
+            + _t("Visitors: {count}").format(count=total_viewers) + "\n"
+            + _t("Likes: {count}").format(count=total_likes) + "\n"
+            + _t("Followers: {count}").format(count=total_followers) + "\n"
+            + _t("Diamonds: {count}").format(count=total_diamonds) + "\n",
+        )
     except Exception:
         pass
 
 def update_stats_file(force=False):
+    """Without force, only notes that the stats changed: the stats thread
+    writes them, at most once a second, instead of every event that changed
+    them."""
     global _stats_dirty, _stats_last_write
     with _stats_lock:
-        now = time.time()
-        if not force and (now - _stats_last_write) < STATS_MIN_INTERVAL:
+        if not force:
             _stats_dirty = True
             return
         _stats_dirty = False
-        _stats_last_write = now
+        _stats_last_write = time.time()
         _write_stats_file()
 
-def flush_stats_file():
+def flush_stats_file(wait=True):
+    """Write the stats when they changed; with wait, not sooner than
+    STATS_MIN_INTERVAL after the last write."""
     with _stats_lock:
         if not _stats_dirty:
             return
+        if wait and time.time() - _stats_last_write < STATS_MIN_INTERVAL:
+            return
     update_stats_file(force=True)
 
+_top_dirty = False
+
 def _write_top_files():
+    global _top_dirty
+    if not _top_dirty:
+        return
+    _top_dirty = False
     try:
         if top_gifters:
             sorted_gifters = sorted(top_gifters.items(), key=lambda x: x[1], reverse=True)
-            with open(TOP_GIFTERS_FILE, "w", encoding="utf-8") as f:
-                for user, diamonds in sorted_gifters:
-                    f.write(f"{user}: {diamonds} diamonds\n")
+            _write_whole_file(
+                TOP_GIFTERS_FILE,
+                "".join(f"{user}: {diamonds} diamonds\n" for user, diamonds in sorted_gifters),
+            )
         if top_likers:
             sorted_likers = sorted(top_likers.items(), key=lambda x: x[1], reverse=True)
-            with open(TOP_LIKES_FILE, "w", encoding="utf-8") as f:
-                for user, likes in sorted_likers:
-                    f.write(f"{user}: {likes}\n")
+            _write_whole_file(TOP_LIKES_FILE, "".join(f"{user}: {likes}\n" for user, likes in sorted_likers))
     except Exception:
-        pass
+        # Changed while sorted: tried again at the next round.
+        _top_dirty = True
+
+# The text files get the lines waiting in memory this often (flush_files).
+WRITE_INTERVAL = 0.5
 
 def update_top_files():
     ticks = 0
+    per_second = round(1 / WRITE_INTERVAL)
     while not _stop_event.is_set():
-        if ticks % 10 == 0:
+        if ticks % (10 * per_second) == 0:
             _write_top_files()
         flush_stats_file()
+        flush_files()
         ticks += 1
-        _stop_event.wait(1)
+        _stop_event.wait(WRITE_INTERVAL)
 
 def _log_to_events(log_text):
     event_text = log_text.rsplit("  ", 1)[0]
     if event_text in _known_events:
         return
     _known_events.add(event_text)
-    try:
-        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(log_text + "\n")
-    except Exception:
-        pass
+    _append_line(EVENTS_FILE, log_text)
 
 def _speak_text(text):
     try:
@@ -811,7 +941,7 @@ def _track_user(event):
             _remember_user(uid, _sanitize_name(nn))
 
 def _apply_like_event(ev):
-    global total_likes
+    global total_likes, _top_dirty
     
     _track_user(ev)
     
@@ -844,6 +974,7 @@ def _apply_like_event(ev):
     increment = inc_val if (isinstance(inc_val, int) and inc_val > 0) else 1
     
     top_likers[user_name] = top_likers.get(user_name, 0) + increment
+    _top_dirty = True
 
     current_user_total = top_likers[user_name]
     like_manager.add_like(user_name, current_user_total)
@@ -865,8 +996,7 @@ async def on_comment(event):
         return
     _known_comments.add(user_comment)
     log_line = f"{user_comment}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    with open(COMMENTS_FILE, "a", encoding="utf-8") as f:
-        f.write(log_line + "\n")
+    _append_line(COMMENTS_FILE, log_line)
     if PREFS.get("comments", True):
         _log_to_events(log_line)
         
@@ -891,8 +1021,7 @@ async def on_follow(event):
     total_followers += 1
     nm = _sanitize_name(event.user.nickname)
     log_line = f"{nm}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    with open(FOLLOWERS_FILE, "a", encoding="utf-8") as f:
-        f.write(log_line + "\n")
+    _append_line(FOLLOWERS_FILE, log_line)
     # Translators: Announced when a new user follows the streamer. {name} is the user's name.
     speak_msg = _t("New follower: {name}").format(name=nm)
     log_msg = f"{speak_msg}  {datetime.datetime.now().strftime('%H:%M:%S')}"
@@ -911,7 +1040,7 @@ async def on_gift(event):
         
     _track_user(event)
     
-    global total_diamonds
+    global total_diamonds, _top_dirty
     if not getattr(event, "repeat_end", True):
         return
     count = getattr(event, "repeat_count", 1) or 1
@@ -929,14 +1058,14 @@ async def on_gift(event):
     if diamonds > 0:
         total_diamonds += diamonds
         top_gifters[display_name] = top_gifters.get(display_name, 0) + diamonds
+        _top_dirty = True
     
     speak_msg = f"Gift: {display_name}: {count} {name}"
     log_msg = f"{speak_msg}  {datetime.datetime.now().strftime('%H:%M:%S')}"
     
     file_line = f"{display_name}: {count} {name}  {datetime.datetime.now().strftime('%H:%M:%S')}"
     
-    with open(GIFTS_FILE, "a", encoding="utf-8") as f:
-        f.write(file_line + "\n")
+    _append_line(GIFTS_FILE, file_line)
         
     if PREFS.get("gifts", False):
         _log_to_events(log_msg)
@@ -972,8 +1101,7 @@ async def on_share(event):
     
     log_line = f"{display_name}  {datetime.datetime.now().strftime('%H:%M:%S')}"
     
-    with open(SHARES_FILE, "a", encoding="utf-8") as f:
-        f.write(log_line + "\n")
+    _append_line(SHARES_FILE, log_line)
         
     if PREFS.get("shares", False):
         # Translators: Announced when a user shares the live stream. {name} is the user's name.
@@ -1016,8 +1144,7 @@ async def on_join(event):
     
     total_viewers = len(visitors)
     log_line = f"{display_name}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-    with open(VISITORS_FILE, "a", encoding="utf-8") as f:
-        f.write(log_line + "\n")
+    _append_line(VISITORS_FILE, log_line)
     if PREFS.get("visitors", False):
         # Translators: Announced when a user joins the live stream. {name} is the user's name.
         msg = _t("{name} joined").format(name=display_name)
@@ -1137,8 +1264,7 @@ async def on_guest_request(event):
         speak_msg = _t("Guest request: {name}").format(name=user_name)
         
         log_line = f"{user_name}  {datetime.datetime.now().strftime('%H:%M:%S')}"
-        with open(REQUESTS_FILE, "a", encoding="utf-8") as f:
-            f.write(log_line + "\n")
+        _append_line(REQUESTS_FILE, log_line)
             
         if PREFS.get("requests", True):
             log_msg = f"{speak_msg}  {datetime.datetime.now().strftime('%H:%M:%S')}"
@@ -1404,7 +1530,7 @@ def connect(username=None, on_connect=None, on_retry=None, on_fail=None, retry_c
 def disconnect():
     global _thread, client, _should_run, _top_thread_started, _stats_thread
     _should_run = False
-    flush_stats_file()
+    flush_stats_file(wait=False)
     _stop_event.set()
     
     _stats_thread = None
@@ -1422,7 +1548,8 @@ def disconnect():
                 pass
         
         like_manager.stop()
-        
+        flush_files()
+
         if 'sound_manager' in globals():
             sound_manager.stop()
         

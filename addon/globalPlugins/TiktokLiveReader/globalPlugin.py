@@ -320,11 +320,7 @@ class GlobalPlugin(NVDA_GlobalPlugin):
 
     def _load_items(self):
         _label, file = self._get_current_file()
-        try:
-            with file.open("r", encoding="utf-8") as f:
-                return [ln.strip() for ln in f if ln.strip()]
-        except OSError:
-            return []
+        return client.read_entries(file)
 
     def _report_no_items(self):
         try:
@@ -838,9 +834,10 @@ class GlobalPlugin(NVDA_GlobalPlugin):
         self._settingsDialog = None
 
     def _persist_index(self):
+        # Written to the positions file when the session ends or NVDA exits
+        # (_cleanup_temp_files), not on every key.
         if not self.clearOnStart:
             self.filePositions[self.currentFileIndex] = self.index
-            self._save_positions_json()
 
     @script(description=_("Next item"))
     def script_nextItem(self, gesture):
@@ -970,6 +967,8 @@ class GlobalPlugin(NVDA_GlobalPlugin):
             client.disconnect()
             if hasattr(self, "speech_manager"):
                 self.speech_manager.stop()
+            if self.active:
+                self._cleanup_temp_files()
             self._archive_session(self.username)
         except Exception:
             pass
