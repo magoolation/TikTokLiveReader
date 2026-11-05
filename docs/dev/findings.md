@@ -266,6 +266,29 @@ one with an antivirus pays more for each file opened), before -> after.
   after 10 s (`STALE_AFTER_BY_KIND`); everything else after 60 s
   (`STALE_AFTER`). The order is fixed: choosing it would need a settings page
   and new strings.
+- F45 (2026-11-05) Every announcement was followed by a fixed second in the
+  sound worker, and every text by another in the speech reader. A short text
+  ("Alice joined") left most of it silent; a long comment was still being
+  spoken when the next ones went to NVDA, which queued them in its own speech
+  queue, out of reach of F44's order and of dropping what waited too long.
+  Now the sound worker speaks each text itself (`announcer.speak_and_wait`,
+  the speech reader thread is gone) with a `CallbackCommand` after it, waits
+  for it, and leaves `GAP` (0.3 s), also between sounds. NVDA does not always
+  say a text was spoken, so the wait ends too:
+  - when NVDA cancels speech (`speech.speechCanceled`, registered while auto
+    speak is on: a key, a focus change), then with `UNCONFIRMED_PAUSE` (1 s)
+    so that what the key brings is heard first;
+  - with speech off, beeps or on demand (`speech.getState().speechMode` not
+    talk): `ui.message` as before, then 1 s;
+  - after a time that fits the text (2 s and 1 s per 8 characters, at most
+    30 s) when the synthesizer does not report where it is (the silence
+    synthesizer never does); after `UNCONFIRMED_LIMIT` (2) such texts in a row
+    only 1 s is waited, until a callback comes again;
+  - not while speech is paused (shift): the text is still to come.
+  The text still goes to braille, as `ui.message` showed it. The same in NVDA
+  2025.1 (the add-on's minimum) and 2026.3 (`speech/extensions.py`,
+  `speech/commands.py`, `speech/manager.py`). Not checked in real NVDA: the
+  sandbox's silent synthesizer only exercises the time limit.
 
 ## Not issues
 

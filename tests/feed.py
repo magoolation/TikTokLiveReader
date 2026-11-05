@@ -462,13 +462,13 @@ def replaying(*frames, end="clean", past_grace_period=True, clock=None, room_inf
 	session = Session(frames, end, past_grace_period, clock=clock, room_info=room_info or {})
 	real_sounds = announcer.sound_manager
 	session.sounds = announcer.sound_manager = _RecordingSounds()
-	real_queue_speech = announcer.queue_speech
+	real_speak_and_wait = announcer.speak_and_wait
 
-	def queue_speech(text, kind=None):
+	def speak_and_wait(text):
 		session.speech.append(text)
-		real_queue_speech(text, kind)
+		real_speak_and_wait(text)
 
-	announcer.queue_speech = queue_speech
+	announcer.speak_and_wait = speak_and_wait
 	runtime = adapter.runtime().modules["TikTokLive"]
 	real_client_class = runtime.TikTokLiveClient
 	runtime.TikTokLiveClient = _ReplayClient
@@ -482,7 +482,7 @@ def replaying(*frames, end="clean", past_grace_period=True, clock=None, room_inf
 				thread.join(10)
 			runtime.TikTokLiveClient = real_client_class
 			announcer.sound_manager = real_sounds
-			announcer.queue_speech = real_queue_speech
+			announcer.speak_and_wait = real_speak_and_wait
 
 
 def run_session(
