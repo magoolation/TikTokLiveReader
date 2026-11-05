@@ -359,6 +359,14 @@ STALE_AFTER = 60.0
 STALE_AFTER_BY_KIND = {"likes": 10.0, "visitors": 10.0}
 # Only the newest of these wait; a newer one pushes out the oldest.
 WAITING_AT_MOST = {"likes": 3, "visitors": 3}
+# Between two announcements: speech waits until NVDA has spoken the text.
+GAP = 0.3
+# After a text NVDA did not report spoken (speech off, beeps or on demand, a
+# synthesizer that does not report where it is) or cancelled (a key: what the
+# key brings is heard first), the pause every text had before.
+UNCONFIRMED_PAUSE = 1.0
+# After this many texts in a row not reported spoken, only that pause is waited.
+UNCONFIRMED_LIMIT = 2
 
 
 def _rank(kind):
@@ -453,7 +461,9 @@ class SoundManager:
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
 
-    def play(self, event_name, play_file=True, on_complete=None, post_delay=1.0, author=None):
+    def play(self, event_name, play_file=True, on_complete=None, post_delay=GAP, author=None):
+        """on_complete may return a longer pause than post_delay to leave before
+        the next."""
 
         mapping = {
             "comments": "comment.wav",
@@ -486,15 +496,17 @@ class SoundManager:
             if fname and play_file:
                 self._play_actual(fname)
                 
+            pause = post_delay
             if cb:
                 try:
-    
-                    cb()
+                    asked = cb()
                 except Exception:
-                    pass
+                    asked = None
+                if isinstance(asked, (int, float)):
+                    pause = max(pause, asked)
 
-            if post_delay > 0:
-                time.sleep(post_delay)
+            if pause > 0:
+                time.sleep(pause)
             
             self._queue.task_done()
 
@@ -996,12 +1008,148 @@ def _log_to_events(log_text, author=None):
     _known_events.add(event_text)
     _append_line(EVENTS_FILE, log_text, author)
 
-def _speak_text(text):
+# Auto speak is on (the plugin's speech manager runs). Texts used to go through
+# speechbuffer.json, read every 0.5 s, with a second after each.
+_listening = False
+# The text NVDA is speaking for the sound worker.
+_speaking = None
+_speaking_lock = threading.Lock()
+# Texts in a row NVDA did not report spoken.
+_unconfirmed = 0
+
+
+class _Utterance:
+    def __init__(self):
+        self.done = threading.Event()
+        self.spoken = False
+
+
+def _longest_wait(text):
+    """How long NVDA may take to speak text at a slow rate."""
+    return min(30.0, 2.0 + len(text) / 8)
+
+
+def _speech_module():
+    """NVDA's speech when it reports what it spoke; None otherwise (speech off,
+    beeps or on demand, or outside NVDA)."""
     try:
-        with open(SPEECH_BUFFER_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+        import speech
+        if speech.getState().speechMode != speech.SpeechMode.talk:
+            return None
+    except Exception:
+        return None
+    return speech
+
+
+def _is_paused(speech):
+    try:
+        return speech.getState().isPaused
+    except Exception:
+        return False
+
+
+def _speak_text(text):
+    """Speak text while auto speak is on and wait until NVDA has spoken it, or
+    cancelled speech; the pause to leave before the next announcement. Without
+    word from NVDA, the wait is cut short: at first after a time that fits the
+    text, after UNCONFIRMED_LIMIT such texts after UNCONFIRMED_PAUSE."""
+    global _unconfirmed
+    if not _listening:
+        return None
+    import wx
+    speech = _speech_module()
+    if speech is None:
+        import ui
+        wx.CallAfter(ui.message, text)
+        return UNCONFIRMED_PAUSE
+    utterance = _Utterance()
+    wx.CallAfter(_speak, speech, text, utterance)
+    trusted = _unconfirmed < UNCONFIRMED_LIMIT
+    wait = _longest_wait(text) if trusted else UNCONFIRMED_PAUSE
+    while not utterance.done.wait(wait):
+        # Paused with shift: the text is still to come.
+        if not _is_paused(speech):
+            break
+        wait = UNCONFIRMED_PAUSE
+    if not utterance.done.is_set():
+        _unconfirmed += 1
+        _finish(utterance, False)
+        return None
+    return GAP if utterance.spoken else UNCONFIRMED_PAUSE
+
+
+def _speak(speech, text, utterance):
+    """On NVDA's main thread: text in speech with a callback after it, and in
+    braille, as ui.message shows it."""
+    global _speaking
+    from speech.commands import CallbackCommand
+    try:
+        speech.speak([text, CallbackCommand(lambda: _reported(utterance), name="TikTok Live Reader")])
+    except Exception:
+        _finish(utterance, False)
+    # Only now: speaking cancels paused speech, which is not this text's.
+    with _speaking_lock:
+        if not utterance.done.is_set():
+            _speaking = utterance
+    try:
+        import braille
+        braille.handler.message(text)
     except Exception:
         pass
+
+
+def _reported(utterance):
+    """NVDA spoke the text: its callback, on NVDA's main thread."""
+    global _unconfirmed
+    _unconfirmed = 0
+    _finish(utterance, True)
+
+
+def _finish(utterance, spoken):
+    global _speaking
+    with _speaking_lock:
+        if utterance.done.is_set():
+            return
+        utterance.spoken = spoken
+        utterance.done.set()
+        if _speaking is utterance:
+            _speaking = None
+
+
+def forget_pending_speech():
+    """Stop waiting for the text being spoken."""
+    with _speaking_lock:
+        utterance = _speaking
+    if utterance is not None:
+        _finish(utterance, False)
+
+
+def _on_speech_canceled():
+    """NVDA cancelled speech (a key, a focus change): the text being spoken will
+    not report it was, so the sound worker goes on."""
+    forget_pending_speech()
+
+
+def start_speaking():
+    """Auto speak on: each announcement is spoken after its sound."""
+    global _listening
+    _listening = True
+    try:
+        import speech
+        speech.speechCanceled.register(_on_speech_canceled)
+    except Exception:
+        pass
+
+
+def stop_speaking():
+    global _listening
+    _listening = False
+    try:
+        import speech
+        speech.speechCanceled.unregister(_on_speech_canceled)
+    except Exception:
+        pass
+    forget_pending_speech()
 
 def _extract_comment_payload(event):
     user = getattr(event, "user", None)
@@ -1052,7 +1200,7 @@ def _handle_speech_and_sound(event_key, speak_text, author=None):
         cb = None
         if speech_enabled:
             def _on_complete():
-                _speak_text(speak_text)
+                return _speak_text(speak_text)
 
             cb = _on_complete
 

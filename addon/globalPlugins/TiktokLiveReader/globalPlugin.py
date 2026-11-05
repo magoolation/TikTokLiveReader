@@ -102,75 +102,22 @@ INDEX_TO_KEY = _filename_key_map()
 
 
 class SpeechManager:
+    """Auto speak: while it runs, the sound worker speaks each announcement after
+    its sound and waits until NVDA has spoken it (client._speak_text)."""
+
     def __init__(self, plugin):
         self._running = False
-        self._thread = None
         self.plugin = plugin
 
     def start(self):
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+        client.start_speaking()
 
     def stop(self):
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=1)
-            self._thread = None
-
-    def speak(self, text):
-        try:
-            with open(SPEECH_BUFFER_FILE, "a", encoding="utf-8") as f:
-                rec = {"text": text, "time": time.time()}
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-
-    def _worker(self):
-        me = threading.current_thread()
-
-        last_pos = 0
-        if SPEECH_BUFFER_FILE.exists():
-            last_pos = SPEECH_BUFFER_FILE.stat().st_size
-
-        while self._running and self._thread is me:
-            if not SPEECH_BUFFER_FILE.exists():
-                time.sleep(0.5)
-                continue
-                
-            try:
-                curr_size = SPEECH_BUFFER_FILE.stat().st_size
-                if curr_size < last_pos:
-                    last_pos = 0
-                
-                if curr_size > last_pos:
-                    with open(SPEECH_BUFFER_FILE, "r", encoding="utf-8") as f:
-                        f.seek(last_pos)
-                        lines = f.readlines()
-                        last_pos = f.tell()
-                        
-                    for line in lines:
-                        if not self._running or self._thread is not me:
-                            break
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-
-                            data = json.loads(line)
-                            txt = data.get("text", "")
-                            if txt:
-                                ui.message(txt)
-                                time.sleep(float(self.plugin.autoSpeakDelay))
-                        except Exception as e:
-                            pass
-
-            except Exception:
-                pass
-            
-            time.sleep(0.5)
+        client.stop_speaking()
 
 
 class GlobalPlugin(NVDA_GlobalPlugin):
