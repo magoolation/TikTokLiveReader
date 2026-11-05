@@ -255,6 +255,17 @@ one with an antivirus pays more for each file opened), before -> after.
   them minutes behind. One that waited 30 s (`announcer.STALE_AFTER`) is now
   dropped; it is in the text files. The sounds are read once and their player
   kept instead of opening the audio device for each.
+- F44 (2026-11-05) Announcements waited in one queue in the order they came.
+  In a busy live likes come from many people at once (each person's summed
+  until a 10 s pause, F40) and visitors keep coming, so comments waited behind
+  them and, with F43, were dropped after 30 s: a tester on a busy live did not
+  hear the comments at all. Now `announcer.AnnouncementQueue` hands them out by
+  `PRIORITY` (comments, gifts, followers, requests, shares, likes, visitors),
+  each kind in the order it came, for the sounds and for the speech. Only the
+  newest 3 likes and 3 visitors wait (`WAITING_AT_MOST`), and they are dropped
+  after 10 s (`STALE_AFTER_BY_KIND`); everything else after 60 s
+  (`STALE_AFTER`). The order is fixed: choosing it would need a settings page
+  and new strings.
 
 ## Not issues
 

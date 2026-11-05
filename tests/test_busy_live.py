@@ -101,6 +101,65 @@ class Announcements(unittest.TestCase):
 		self.assertTrue(f.wait_until(lambda: sounds._queue.unfinished_tasks == 0, timeout=5))
 		self.assertEqual(done, ["first"])
 
+	def test_comments_come_before_what_waited_longer(self):
+		waiting = announcer.AnnouncementQueue()
+		for kind in ("visitors", "likes", "shares", "requests", "followers", "gifts", "comments"):
+			waiting.put(kind, kind)
+		waiting.put("comments", "second comment")
+		taken = [waiting.get(timeout=0) for _ in range(8)]
+		self.assertEqual(
+			taken,
+			[
+				"comments",
+				"second comment",
+				"gifts",
+				"followers",
+				"requests",
+				"shares",
+				"likes",
+				"visitors",
+			],
+		)
+
+	def test_only_the_newest_likes_wait(self):
+		waiting = announcer.AnnouncementQueue()
+		for number in range(10):
+			waiting.put("likes", f"like {number}")
+		waiting.put("comments", "hi")
+		taken = [waiting.get(timeout=0) for _ in range(4)]
+		self.assertEqual(taken, ["hi", "like 7", "like 8", "like 9"])
+		self.assertRaises(announcer.queue.Empty, waiting.get, timeout=0)
+		self.assertEqual(waiting.unfinished_tasks, 4)
+
+	def test_likes_go_stale_before_comments(self):
+		self.addCleanup(setattr, announcer, "STALE_AFTER_BY_KIND", announcer.STALE_AFTER_BY_KIND)
+		announcer.STALE_AFTER_BY_KIND = {"likes": 0.1}
+		waiting = announcer.AnnouncementQueue()
+		waiting.put("likes", "like")
+		waiting.put("comments", "hi")
+		time.sleep(0.2)
+		self.assertEqual(waiting.get(timeout=0), "hi")
+		self.assertRaises(announcer.queue.Empty, waiting.get, timeout=0)
+
+	def test_a_comment_queued_behind_many_likes_is_played_next(self):
+		sounds = announcer.SoundManager(announcer.ADDON_DIR)
+		sounds.start()
+		self.addCleanup(sounds.stop)
+		done = []
+
+		def like(number):
+			sounds.play(
+				"likes", play_file=False, on_complete=lambda: done.append(f"like {number}"), post_delay=0.3
+			)
+
+		like(0)
+		self.assertTrue(f.wait_until(lambda: done == ["like 0"], timeout=5))
+		for number in range(1, 5):
+			like(number)
+		sounds.play("comments", play_file=False, on_complete=lambda: done.append("hi"), post_delay=0.0)
+		self.assertTrue(f.wait_until(lambda: sounds._queue.unfinished_tasks == 0, timeout=5))
+		self.assertEqual(done, ["like 0", "hi", "like 2", "like 3", "like 4"])
+
 
 if __name__ == "__main__":
 	unittest.main()

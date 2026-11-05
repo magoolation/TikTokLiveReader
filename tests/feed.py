@@ -464,9 +464,9 @@ def replaying(*frames, end="clean", past_grace_period=True, clock=None, room_inf
 	session.sounds = announcer.sound_manager = _RecordingSounds()
 	real_queue_speech = announcer.queue_speech
 
-	def queue_speech(text):
+	def queue_speech(text, kind=None):
 		session.speech.append(text)
-		real_queue_speech(text)
+		real_queue_speech(text, kind)
 
 	announcer.queue_speech = queue_speech
 	runtime = adapter.runtime().modules["TikTokLive"]
