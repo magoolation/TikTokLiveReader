@@ -349,9 +349,79 @@ class LikeManager:
 like_manager = LikeManager()
 
 
+# Announced first to last, each kind in the order it came: in a busy live
+# likes and visitors outnumber comments, which waited behind them.
+PRIORITY = ("comments", "gifts", "followers", "requests", "shares", "likes", "visitors")
 # Announcements are at least a second apart, so a busy live leaves them behind;
 # one that waited this long is dropped (it is in the text files).
-STALE_AFTER = 30.0
+STALE_AFTER = 60.0
+# Who liked or came in a while ago is no news.
+STALE_AFTER_BY_KIND = {"likes": 10.0, "visitors": 10.0}
+# Only the newest of these wait; a newer one pushes out the oldest.
+WAITING_AT_MOST = {"likes": 3, "visitors": 3}
+
+
+def _rank(kind):
+    try:
+        return PRIORITY.index(kind)
+    except ValueError:
+        return len(PRIORITY)
+
+
+class AnnouncementQueue:
+    """What waits to be announced, handed out by PRIORITY; what waited too long
+    is dropped on the way."""
+
+    def __init__(self):
+        # Kind: (time queued, item), oldest first.
+        self._waiting = {}
+        self._ready = threading.Condition()
+        self.unfinished_tasks = 0
+
+    def put(self, kind, item):
+        with self._ready:
+            waiting = self._waiting.setdefault(kind, collections.deque())
+            waiting.append((time.monotonic(), item))
+            self.unfinished_tasks += 1
+            if len(waiting) > WAITING_AT_MOST.get(kind, len(waiting)):
+                waiting.popleft()
+                self.unfinished_tasks -= 1
+            self._ready.notify()
+
+    def get(self, timeout):
+        """The next item; queue.Empty when none came within timeout seconds."""
+        deadline = time.monotonic() + timeout
+        with self._ready:
+            while True:
+                found, item = self._next()
+                if found:
+                    return item
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                self._ready.wait(remaining)
+
+    def _next(self):
+        now = time.monotonic()
+        for kind in sorted(self._waiting, key=_rank):
+            waiting = self._waiting[kind]
+            limit = STALE_AFTER_BY_KIND.get(kind, STALE_AFTER)
+            while waiting:
+                queued, item = waiting.popleft()
+                if now - queued <= limit:
+                    return True, item
+                self.unfinished_tasks -= 1
+        return False, None
+
+    def task_done(self):
+        with self._ready:
+            self.unfinished_tasks -= 1
+
+    def clear(self):
+        with self._ready:
+            for waiting in self._waiting.values():
+                self.unfinished_tasks -= len(waiting)
+            self._waiting.clear()
 
 
 class SoundManager:
@@ -361,7 +431,7 @@ class SoundManager:
         self.volume = 100
         # By file name: (volume, the WAV to play from memory).
         self._sounds = {}
-        self._queue = queue.Queue()
+        self._queue = AnnouncementQueue()
         self._running = True
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
@@ -371,16 +441,14 @@ class SoundManager:
 
     def stop(self):
         self._running = False
-        with self._queue.mutex:
-            self._queue.queue.clear()
+        self._queue.clear()
 
     def clear(self):
-        with self._queue.mutex:
-            self._queue.queue.clear()
+        self._queue.clear()
 
     def start(self):
         if not self._running:
-            self._queue = queue.Queue()
+            self._queue = AnnouncementQueue()
             self._running = True
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
@@ -398,7 +466,7 @@ class SoundManager:
         }
         
         fname = mapping.get(event_name, f"{event_name}.wav")
-        self._queue.put((fname, play_file, on_complete, post_delay, time.monotonic(), author))
+        self._queue.put(event_name, (fname, play_file, on_complete, post_delay, author))
 
     def _worker(self):
         me = threading.current_thread()
@@ -408,12 +476,10 @@ class SoundManager:
             except queue.Empty:
                 continue
 
-            fname, play_file, cb, post_delay, queued_at, author = item
+            fname, play_file, cb, post_delay, author = item
             # Ignored since it was queued: their earlier comments are not
             # read out either.
-            if time.monotonic() - queued_at > STALE_AFTER or (
-                author is not None and _is_ignored_handle(author[0])
-            ):
+            if author is not None and _is_ignored_handle(author[0]):
                 self._queue.task_done()
                 continue
 
